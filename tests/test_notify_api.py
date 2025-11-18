@@ -17,11 +17,13 @@ async def test_notify_broadcast(monkeypatch):
     notify_api.NOTIFY_API_KEY = "secret"
 
     # Mock subscribers map (id -> metadata)
-    monkeypatch.setattr(notify_api, "_load_subscribers_map", lambda: {
-        1001: {"first_name": "Alice", "last_name": "Aldo", "username": "alice"},
-        1002: {"first_name": "Bob", "last_name": "Barker", "username": "bob"},
-        1003: {"first_name": "Carol", "last_name": "Carter", "username": "carol"},
-    })
+    async def _fake_subs_map_1():
+        return {
+            1001: {"first_name": "Alice", "last_name": "Aldo", "username": "alice"},
+            1002: {"first_name": "Bob", "last_name": "Barker", "username": "bob"},
+            1003: {"first_name": "Carol", "last_name": "Carter", "username": "carol"},
+        }
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_1)
 
     called = []
 
@@ -72,10 +74,12 @@ async def test_notify_by_username(monkeypatch):
         text = kwargs.get('text') if 'text' in kwargs else (args[1] if len(args) > 1 else None)
         called.append((chat_id, text))
 
-    monkeypatch.setattr(notify_api, "_load_subscribers_map", lambda: {
-        2001: {"first_name": "Eve", "last_name": "Evans", "username": "eve"},
-        2002: {"first_name": "Mallory", "last_name": "Mills", "username": "mallory"},
-    })
+    async def _fake_subs_map_2():
+        return {
+            2001: {"first_name": "Eve", "last_name": "Evans", "username": "eve"},
+            2002: {"first_name": "Mallory", "last_name": "Mills", "username": "mallory"},
+        }
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_2)
     monkeypatch.setattr(notify_api, "bot", type("X", (), {"send_message": staticmethod(fake_send_message)}))
 
     with TestClient(notify_api.app) as client:
@@ -97,11 +101,13 @@ async def test_notify_by_first_name(monkeypatch):
         text = kwargs.get('text') if 'text' in kwargs else (args[1] if len(args) > 1 else None)
         called.append((chat_id, text))
 
-    monkeypatch.setattr(notify_api, "_load_subscribers_map", lambda: {
-        3001: {"first_name": "John", "last_name": "Johnson", "username": "john"},
-        3002: {"first_name": "Johnny", "last_name": "Johnson", "username": "johnny"},
-        3003: {"first_name": "Alice", "last_name": "Anderson", "username": "alice"},
-    })
+    async def _fake_subs_map_3():
+        return {
+            3001: {"first_name": "John", "last_name": "Johnson", "username": "john"},
+            3002: {"first_name": "Johnny", "last_name": "Johnson", "username": "johnny"},
+            3003: {"first_name": "Alice", "last_name": "Anderson", "username": "alice"},
+        }
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_3)
     monkeypatch.setattr(notify_api, "bot", type("X", (), {"send_message": staticmethod(fake_send_message)}))
 
     with TestClient(notify_api.app) as client:
@@ -123,11 +129,13 @@ async def test_notify_by_last_name(monkeypatch):
         text = kwargs.get('text') if 'text' in kwargs else (args[1] if len(args) > 1 else None)
         called.append((chat_id, text))
 
-    monkeypatch.setattr(notify_api, "_load_subscribers_map", lambda: {
-        4001: {"first_name": "John", "last_name": "Smith", "username": "john"},
-        4002: {"first_name": "Mary", "last_name": "Smith", "username": "mary"},
-        4003: {"first_name": "Alice", "last_name": "Jones", "username": "alice"},
-    })
+    async def _fake_subs_map_4():
+        return {
+            4001: {"first_name": "John", "last_name": "Smith", "username": "john"},
+            4002: {"first_name": "Mary", "last_name": "Smith", "username": "mary"},
+            4003: {"first_name": "Alice", "last_name": "Jones", "username": "alice"},
+        }
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_4)
     monkeypatch.setattr(notify_api, "bot", type("X", (), {"send_message": staticmethod(fake_send_message)}))
 
     with TestClient(notify_api.app) as client:
@@ -136,10 +144,37 @@ async def test_notify_by_last_name(monkeypatch):
         data = resp.json()
         assert data["sent"] == 2
 
+
+def test_notify_by_nip(monkeypatch):
+    monkeypatch.setenv("NOTIFY_API_KEY", "secret")
+    notify_api.NOTIFY_API_KEY = "secret"
+    called = []
+
+    async def fake_send_message(*args, **kwargs):
+        chat_id = kwargs.get('chat_id') if 'chat_id' in kwargs else (args[0] if args else None)
+        text = kwargs.get('text') if 'text' in kwargs else (args[1] if len(args) > 1 else None)
+        called.append((chat_id, text))
+
+    async def _fake_subs_map_6():
+        return {
+            9001: {"first_name": "A", "last_name": "A", "username": "a", "nip": "NIP123"},
+            9002: {"first_name": "B", "last_name": "B", "username": "b", "nip": "NIP999"},
+        }
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_6)
+    monkeypatch.setattr(notify_api, "bot", type("X", (), {"send_message": staticmethod(fake_send_message)}))
+
+    with TestClient(notify_api.app) as client:
+        resp = client.post("/notify", json={"message": "Hello NIP", "nip": "NIP123"}, headers={"X-API-KEY": "secret"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sent"] == 1
+
 def test_get_subscribers(monkeypatch):
     monkeypatch.setenv("NOTIFY_API_KEY", "secret")
     notify_api.NOTIFY_API_KEY = "secret"
-    monkeypatch.setattr(notify_api, "_load_subscribers_map", lambda: {4001: {"first_name": "AA", "last_name": "AA-L", "username": "aa"}})
+    async def _fake_subs_map_5():
+        return {4001: {"first_name": "AA", "last_name": "AA-L", "username": "aa"}}
+    monkeypatch.setattr(notify_api, "_load_subscribers_map", _fake_subs_map_5)
     with TestClient(notify_api.app) as client:
         resp = client.get("/subscribers", headers={"X-API-KEY": "secret"})
         assert resp.status_code == 200
@@ -242,6 +277,35 @@ def test_put_update_subscriber_unauthorized(tmp_path, monkeypatch):
     with TestClient(notify_api.app) as client:
         resp = client.put('/subscribers/3333', json={'first_name': 'X'}, headers={})
         assert resp.status_code == 401
+
+
+def test_put_update_subscriber_set_nip(tmp_path, monkeypatch):
+    subs_file = tmp_path / "subs_map_nip.json"
+    subs_map = {"1410681826": {"first_name": None, "last_name": None, "username": None, "subscribed_at": "2025-11-18T03:08:47.582244+00:00"}}
+    subs_file.write_text(json.dumps(subs_map), encoding='utf-8')
+    monkeypatch.setenv('SUBSCRIBERS_FILE', str(subs_file))
+    monkeypatch.setenv('NOTIFY_API_KEY', 'secret')
+    notify_api.NOTIFY_API_KEY = 'secret'
+    with TestClient(notify_api.app) as client:
+        resp = client.put('/subscribers/1410681826', json={'nip': '123456789012345'}, headers={'X-API-KEY': 'secret'})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['1410681826']['nip'] == '123456789012345'
+
+
+def test_put_update_subscriber_truncates_nip(tmp_path, monkeypatch):
+    subs_file = tmp_path / "subs_map_nip2.json"
+    subs_file.write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('SUBSCRIBERS_FILE', str(subs_file))
+    monkeypatch.setenv('NOTIFY_API_KEY', 'secret')
+    notify_api.NOTIFY_API_KEY = 'secret'
+    long_nip = 'X' * 25
+    with TestClient(notify_api.app) as client:
+        resp = client.put('/subscribers/3333', json={'nip': long_nip}, headers={'X-API-KEY': 'secret'})
+        assert resp.status_code == 200
+        data = resp.json()
+        # Should be truncated to 18 characters
+        assert len(data['3333']['nip']) == 18
 
 
 def test_put_rejects_raw_telegram_update(tmp_path, monkeypatch):

@@ -8,6 +8,7 @@ import socket
 import httpx
 import asyncio
 from dotenv import load_dotenv
+import db
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
@@ -37,12 +38,31 @@ def _get_subscribers_file() -> str:
     return os.getenv("SUBSCRIBERS_FILE", DEFAULT_SUBSCRIBERS_FILE)
 
 
-def _load_subscribers_map() -> dict:
+def _normalize_nip(nip: str | None) -> str | None:
+    if nip is None:
+        return None
+    try:
+        nip_str = str(nip)
+    except Exception:
+        return None
+    if len(nip_str) > 18:
+        logger.warning("nip is longer than 18 characters; truncating")
+        return nip_str[:18]
+    return nip_str
+
+
+async def _load_subscribers_map() -> dict:
     """Return mapping chat_id -> metadata dict.
 
     Example: {123: {"first_name": "Alice", "username": "alice", "subscribed_at": "..."}}
     """
     try:
+        # if DB is enabled, use it
+        if db.is_db_enabled():
+            try:
+                return await db.get_subscribers_map()
+            except Exception:
+                logger.exception("db.get_subscribers_map failed, falling back to file storage")
         file_path = _get_subscribers_file()
         if not os.path.exists(file_path):
             return {}
@@ -68,7 +88,7 @@ def _load_subscribers_map() -> dict:
                     logger.exception("Failed to backup corrupted subscribers file %s", file_path)
                 # Write an empty map to replace the corrupted file
                 try:
-                    _save_subscribers_map({})
+                    await _save_subscribers_map({})
                 except Exception:
                     logger.exception("Failed to initialize subscribers file after corruption %s", file_path)
                 return {}
@@ -78,7 +98,7 @@ def _load_subscribers_map() -> dict:
                 subs_map = {int(cid): {"first_name": None, "last_name": None, "username": None, "subscribed_at": now} for cid in data}
                 # save converted format back to file
                 try:
-                    _save_subscribers_map(subs_map)
+                    await _save_subscribers_map(subs_map)
                 except Exception:
                     logger.exception("Failed to persist converted subscribers map to %s", file_path)
                 return subs_map
@@ -89,6 +109,7 @@ def _load_subscribers_map() -> dict:
                     meta = meta or {}
                     return {
                         "first_name": meta.get("first_name"),
+                        "nip": _normalize_nip(meta.get("nip")),
                         "last_name": meta.get("last_name"),
                         "username": meta.get("username"),
                         "subscribed_at": meta.get("subscribed_at"),
@@ -102,7 +123,7 @@ def _load_subscribers_map() -> dict:
                     needs_write = False
                 if needs_write:
                     try:
-                        _save_subscribers_map(subs_map)
+                        await _save_subscribers_map(subs_map)
                         logger.info("Migrated subscribers file to include last_name: %s", file_path)
                     except Exception:
                         logger.exception("Failed to save normalized subscribers map to %s", file_path)
@@ -115,16 +136,24 @@ def _load_subscribers_map() -> dict:
         return {}
 
 
-def _load_subscribers() -> set:
+async def _load_subscribers() -> set:
     try:
-        return set(_load_subscribers_map().keys())
+        m = await _load_subscribers_map()
+        return set(m.keys())
     except Exception:
         logger.exception("Failed to load subscribers")
         return set()
 
 
-def _save_subscribers_map(subs_map: dict) -> None:
+async def _save_subscribers_map(subs_map: dict) -> None:
     try:
+        # if DB enabled, persist to DB
+        if db.is_db_enabled():
+            try:
+                await db.save_subscribers_map(subs_map or {})
+                return
+            except Exception:
+                logger.exception("db.save_subscribers_map failed, falling back to file storage")
         file_path = _get_subscribers_file()
         # dump map with string keys for JSON
         with open(file_path, "w", encoding="utf-8") as f:
@@ -133,6 +162,7 @@ def _save_subscribers_map(subs_map: dict) -> None:
                 v = v or {}
                 normalized[str(k)] = {
                     "first_name": v.get("first_name"),
+                    "nip": _normalize_nip(v.get("nip")),
                     "last_name": v.get("last_name"),
                     "username": v.get("username"),
                     "subscribed_at": v.get("subscribed_at"),
@@ -147,11 +177,48 @@ def _save_subscribers_map(subs_map: dict) -> None:
 def _save_subscribers(subs: set) -> None:
     # backward-compat helper; convert set to map with minimal metadata (no names)
     subs_map = {int(cid): {"first_name": None, "last_name": None, "username": None, "subscribed_at": datetime.now(timezone.utc).isoformat()} for cid in subs}
-    _save_subscribers_map(subs_map)
+    # for DB storage, call the async save
+    # attempt to write synchronously by running the coroutine if DB is enabled
+    if db.is_db_enabled():
+        try:
+            asyncio.run(db.save_subscribers_map(subs_map))
+            return
+        except Exception:
+            logger.exception("Failed to save via DB; falling back to file storage")
+    # fallback to JSON file
+    # Note: _save_subscribers_map is now async; to preserve behavior, write file directly
+    try:
+        file_path = _get_subscribers_file()
+        with open(file_path, "w", encoding="utf-8") as f:
+            normalized = {}
+            for k, v in subs_map.items():
+                v = v or {}
+                normalized[str(k)] = {
+                    "first_name": v.get("first_name"),
+                    "nip": _normalize_nip(v.get("nip")),
+                    "last_name": v.get("last_name"),
+                    "username": v.get("username"),
+                    "subscribed_at": v.get("subscribed_at"),
+                    "updated_at": v.get("updated_at", None),
+                }
+            json.dump(normalized, f)
+        logger.info("Saved subscribers file %s with %d subscribers", file_path, len(normalized))
+    except Exception:
+        logger.exception("Failed to save subscribers to %s", file_path)
 
 
-def add_subscriber(chat_id: int, first_name: str = None, username: str = None, last_name: str = None) -> None:
-    subs_map = _load_subscribers_map()
+async def add_subscriber(chat_id: int, first_name: str = None, username: str = None, last_name: str = None, nip: str = None) -> None:
+    # Normalize/truncate nip value early to ensure consistent behavior across DB and JSON
+    nip = _normalize_nip(nip)
+    if db.is_db_enabled():
+        # upsert into DB
+        try:
+            await db.upsert_subscriber(chat_id, first_name=first_name, last_name=last_name, username=username, nip=nip)
+            logger.info("DB upserted subscriber %s metadata: f:%s l:%s u:%s", chat_id, first_name, last_name, username)
+            return
+        except Exception:
+            logger.exception("db.upsert_subscriber failed, falling back to JSON file")
+    subs_map = await _load_subscribers_map()
     now = datetime.now(timezone.utc).isoformat()
     if chat_id in subs_map:
         # update metadata if changed and refresh subscribe timestamp
@@ -166,19 +233,23 @@ def add_subscriber(chat_id: int, first_name: str = None, username: str = None, l
         if username and meta.get("username") != username:
             meta["username"] = username
             updated = True
+        if nip and meta.get("nip") != nip:
+            meta["nip"] = nip
+            updated = True
         if updated:
             meta["updated_at"] = now
             subs_map[int(chat_id)] = meta
-            _save_subscribers_map(subs_map)
+            await _save_subscribers_map(subs_map)
             logger.info("Updated subscriber %s metadata: %s", chat_id, meta)
-        return
+            return
     subs_map[int(chat_id)] = {
         "first_name": first_name,
         "last_name": last_name,
+           "nip": nip,
         "username": username,
         "subscribed_at": now,
     }
-    _save_subscribers_map(subs_map)
+    await _save_subscribers_map(subs_map)
     logger.info("Added new subscriber %s metadata: %s", chat_id, subs_map[int(chat_id)])
 
 
@@ -202,7 +273,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Only store private chat users
     chat_type = getattr(message.chat, "type", None)
     if chat_type == "private" and uid:
-        add_subscriber(uid, getattr(user, "first_name", None), getattr(user, "username", None), getattr(user, "last_name", None))
+        await add_subscriber(uid, getattr(user, "first_name", None), getattr(user, "username", None), getattr(user, "last_name", None))
         # optional follow-up
         if FOLLOWUP_DELAY > 0 and context and getattr(context, "application", None):
             context.application.create_task(
@@ -263,7 +334,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type != "private" or uid is None:
         return
     # call add_subscriber; it will update metadata only if changed and not overwrite subscribed_at
-    add_subscriber(uid, getattr(user, "first_name", None), getattr(user, "username", None), getattr(user, "last_name", None))
+    await add_subscriber(uid, getattr(user, "first_name", None), getattr(user, "username", None), getattr(user, "last_name", None))
 
 
 def _is_local_ip(host: str) -> bool:
@@ -312,7 +383,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await message.reply_text("Usage: /broadcast <message>")
         return
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     subs = set(subs_map.keys())
     if not subs:
         await message.reply_text("No subscribers to broadcast to.")
@@ -399,6 +470,13 @@ def main() -> None:
         )
 
     app = ApplicationBuilder().token(token).build()
+
+    # Initialize DB schema if using a database
+    if db.is_db_enabled():
+        try:
+            asyncio.run(db.init_db())
+        except Exception:
+            logger.exception("Failed to initialize DB schema on startup")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))

@@ -6,7 +6,7 @@ import logging
 from typing import Optional, List
 from dotenv import load_dotenv
 from telegram import Bot
-from bot import _load_subscribers_map, _save_subscribers_map
+from bot import _load_subscribers_map, _save_subscribers_map, _normalize_nip
 from datetime import datetime, timezone
 
 load_dotenv()
@@ -37,6 +37,7 @@ class NotifyRequest(BaseModel):
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    nip: Optional[str] = None
     model_config = ConfigDict(extra='forbid')
 
 
@@ -44,6 +45,7 @@ class SubscriberUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     username: Optional[str] = None
+    nip: Optional[str] = None
     model_config = ConfigDict(extra='forbid')
 
 
@@ -78,7 +80,7 @@ async def notify(request: Request, payload: NotifyRequest):
         ok = await b.send_message(chat_id=payload.chat_id, text=payload.message)
         return {"sent": 1, "ok": True}
     # targeting: username / first_name
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     if payload.username:
         # exact match username (case-insensitive)
         targets = [cid for cid, meta in subs_map.items() if meta and meta.get("username") and meta.get("username").lower() == payload.username.lower()]
@@ -91,6 +93,10 @@ async def notify(request: Request, payload: NotifyRequest):
     else:
         # broadcast to all
         targets = list(subs_map.keys())
+    if payload.nip:
+        # exact match nip value (case-sensitive); normalize input first to ensure consistent matching
+        target_nip = _normalize_nip(payload.nip)
+        targets = [cid for cid, meta in subs_map.items() if meta and meta.get("nip") and meta.get("nip") == target_nip]
 
     if not targets:
         return {"sent": 0, "ok": True}
@@ -107,17 +113,17 @@ async def notify(request: Request, payload: NotifyRequest):
 
 
 @app.get("/subscribers")
-def get_subscribers(request: Request):
+async def get_subscribers(request: Request):
     _check_api_key(request)
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     # Convert keys to strings for JSON serialization
     return {str(k): v for k, v in subs_map.items()}
 
 
 @app.put("/subscribers/{chat_id}")
-def update_subscriber(request: Request, chat_id: int, payload: SubscriberUpdate):
+async def update_subscriber(request: Request, chat_id: int, payload: SubscriberUpdate):
     _check_api_key(request)
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     meta = subs_map.get(int(chat_id), {})
     if payload.first_name is not None:
         meta["first_name"] = payload.first_name
@@ -125,9 +131,11 @@ def update_subscriber(request: Request, chat_id: int, payload: SubscriberUpdate)
         meta["last_name"] = payload.last_name
     if payload.username is not None:
         meta["username"] = payload.username
+    if payload.nip is not None:
+        meta["nip"] = _normalize_nip(payload.nip)
     meta["updated_at"] = datetime.now(timezone.utc).isoformat()
     subs_map[int(chat_id)] = meta
-    _save_subscribers_map(subs_map)
+    await _save_subscribers_map(subs_map)
     return {str(chat_id): meta}
 
 
@@ -143,14 +151,14 @@ async def sync_subscriber(request: Request, chat_id: int):
     except Exception as e:
         logger.exception("Failed to fetch chat info for %s: %s", chat_id, e)
         raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found or not accessible")
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     meta = subs_map.get(int(chat_id), {})
     meta["first_name"] = getattr(chat, "first_name", None)
     meta["last_name"] = getattr(chat, "last_name", None)
     meta["username"] = getattr(chat, "username", None)
     meta["updated_at"] = datetime.now(timezone.utc).isoformat()
     subs_map[int(chat_id)] = meta
-    _save_subscribers_map(subs_map)
+    await _save_subscribers_map(subs_map)
     return {str(chat_id): meta}
 
 
@@ -160,7 +168,7 @@ async def sync_all_subscribers(request: Request):
     b = get_bot()
     if b is None:
         raise HTTPException(status_code=500, detail="Server not configured with TELEGRAM_TOKEN")
-    subs_map = _load_subscribers_map()
+    subs_map = await _load_subscribers_map()
     if not subs_map:
         return {"updated": 0, "ok": True}
     semaphore = asyncio.Semaphore(NOTIFY_CONCURRENCY)
@@ -182,7 +190,7 @@ async def sync_all_subscribers(request: Request):
             return True
     tasks = [asyncio.create_task(_sync_one(cid)) for cid in subs_map.keys()]
     await asyncio.gather(*tasks)
-    _save_subscribers_map(subs_map)
+    await _save_subscribers_map(subs_map)
     return {"updated": updated, "ok": True}
 
 

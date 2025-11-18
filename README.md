@@ -65,6 +65,27 @@ Logging best practices:
 - Avoid logging secrets (the token is never logged by default).
 - For production, route logs to an external logger/monitoring solution (Sentry, DataDog, ELK stack).
 
+## VSCode / Pylance missing imports
+
+If VSCode shows diagnostics like `Import "sqlalchemy" could not be resolved` (Pylance), it usually means the interpreter selected by VSCode doesn't have package dependencies installed.
+
+Steps to resolve:
+
+1. Select the Python interpreter used by your project: open Command Palette (Ctrl+Shift+P) → 'Python: Select Interpreter' → choose the virtual environment you use (e.g., `bot-tele` conda environment).
+2. Install runtime dependencies into that interpreter: `pip install -r requirements.txt` (or `pip install -r requirements-dev.txt` if developing).
+3. Restart the editor or reload window (Ctrl+Shift+P → 'Developer: Reload Window') so Pylance refreshes.
+
+If you intentionally want SQLAlchemy optional for local development, the code defensively checks for it at runtime; to silence Pylance warnings instead of installing packages, you can add the setting in `.vscode/settings.json` (project workspace) to ignore missing import diagnostics from Pylance:
+
+```json
+{
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none"
+  }
+}
+```
+
+Prefer the install + interpreter selection approach so you get helpful linting & type checks.
 Subscriber & dispatching
 
 - When a user issues `/start` in a private chat, the bot will store their chat id in a subscribers file (`subscribers.json` by default). This allows the bot to proactively reach out to users later (for notifications, broadcasts, etc.).
@@ -85,6 +106,142 @@ $env:ADMIN_CHAT_ID = '12345678'
 $env:TELEGRAM_TOKEN = '123456:ABC-DEF...'
 python .\bot.py
 ```
+
+## PostgreSQL integration (optional)
+
+If you want to store subscribers reliably in a production-grade database, set the `DATABASE_URL` environment variable to a PostgreSQL database using the `asyncpg` driver. Example:
+
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://dbuser:dbpassword@db-host.example.com:5432/bottele"
+$env:TELEGRAM_TOKEN = '123456:ABC-DEF...'
+python .\bot.py
+```
+
+Best practices
+
+- Use an environment variable (not a committed file) to store your database connection string.
+- Prefer `asyncpg` (as shown) as it plays well with async SQLAlchemy.
+- Use a secrets manager for credentials (AWS Secrets Manager, Vault, etc.) instead of embedding credentials in the environment for long-term production deployments.
+- Use database migrations (Alembic) to manage schema changes in production.
+- Keep the database server updated and secure; restrict access by network/firewall and use TLS for client connections where available.
+- Monitor DB connection pool size (defaults are usually safe for small bots, but scale with your load.)
+
+How the project uses DATABASE_URL
+
+- If `DATABASE_URL` is set and the environment has SQLAlchemy and an async driver installed, the bot will use PostgreSQL and an ORM model to persist subscribers (columns: chat_id, first_name, last_name, username, subscribed_at, updated_at).
+- If `DATABASE_URL` is NOT set, the project falls back to the JSON file (legacy behavior) so the bot remains simple and developer-friendly in small deployments.
+
+## Migration helper
+
+If you already have a `subscribers.json` file and want to move it to Postgres, use the simple migration script provided at `scripts/migrate_subscribers.py` (this will upsert the data into the configured database):
+
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://dbuser:dbpassword@localhost:5432/bottele"
+python scripts/migrate_subscribers.py
+```
+
+For production-grade migrations and versioned changes, use Alembic. The codebase includes SQLAlchemy models that make it straightforward to start Alembic-based migrations (see Alembic docs: https://alembic.sqlalchemy.org).
+
+## Local dev with Docker Compose
+
+This repository includes `docker-compose.yml` and convenience scripts to quickly run Postgres locally for development.
+
+1. Start Postgres (PowerShell):
+
+```powershell
+# optional: change .env.dev values to fit your environment
+.\scripts\start_postgres_dev.ps1
+```
+
+2. Start Postgres (macOS/Linux):
+
+```bash
+./scripts/start_postgres_dev.sh
+```
+
+3. The start script initializes the DB schema automatically by calling `db.init_db()` and sets the `DATABASE_URL` to the local instance.
+
+4. You can also run the bot in the dev environment via PowerShell or bash. Example (PowerShell):
+
+```powershell
+# load env vars from .env.dev (PowerShell)
+Set-Content -Path .env -Value (Get-Content .env.dev -Raw)
+$env:DATABASE_URL = "postgresql+asyncpg://botuser:botpass@127.0.0.1:5432/bottele"
+python .\bot.py
+```
+
+Notes
+
+- The Postgres data is persisted under `./data/postgres` in a volume bind so the DB persists across container restarts.
+- The default dev credentials are `botuser` / `botpass` / `bottele` and defined in `.env.dev` and `docker-compose.yml`. If you change them, update `DATABASE_URL` appropriately.
+- If you want a throwaway DB, remove the `./data/postgres` folder.
+
+## Testing with Postgres
+
+If you want to run tests against a real Postgres DB, start the dev Postgres container as shown above and then run tests with the `DATABASE_URL` set in your environment.
+
+Example (PowerShell):
+
+```powershell
+.\scripts\start_postgres_dev.ps1
+# optionally set/override DATABASE_URL explicitly
+$env:DATABASE_URL = 'postgresql+asyncpg://botuser:botpass@127.0.0.1:5432/bottele'
+pytest -q
+```
+
+After you're done, bring down the Postgres container:
+
+```powershell
+.\scripts\stop_postgres_dev.ps1
+```
+
+## Quick dev-run helper
+
+To run the bot locally using the dev Postgres setup, use the provided dev-run scripts.
+
+PowerShell (Windows):
+
+```powershell
+.\scripts\dev_run.ps1
+```
+
+macOS/Linux:
+
+```bash
+./scripts/dev_run.sh
+```
+
+These scripts copy `.env.dev` into `.env`, bring up the dev Postgres container, initialize the DB schema, and run the bot in the current shell session.
+
+## Alembic quick-start (recommended)
+
+1. Install alembic (dev environment):
+
+```powershell
+pip install alembic
+```
+
+2. Initialize the alembic folder in your repository (one-time):
+
+```powershell
+alembic init alembic
+```
+
+3. Edit `alembic/env.py` and set the target metadata to import your SQLAlchemy models (for example: `from db import Base` then set `target_metadata = Base.metadata`). This allows `--autogenerate` to inspect the models.
+
+4. Generate a migration:
+
+```powershell
+alembic revision --autogenerate -m "create subscribers table"
+```
+
+5. Apply the migration to your DB:
+
+```powershell
+alembic upgrade head
+```
+
+Using Alembic ensures that production schema changes are versioned and applied cleanly across environments.
 
 Proactive send examples:
 
