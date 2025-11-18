@@ -14,7 +14,7 @@ async def test_start_and_help_handlers(caplog, tmp_path, monkeypatch):
         def __init__(self):
             self.text = ''
             self.chat = Chat(id=1, type='private')
-            self.from_user = User(id=1, is_bot=False, first_name='Test')
+            self.from_user = User(id=1, is_bot=False, first_name='Test', last_name='Tester')
             self.replies = []
 
         async def reply_text(self, text):
@@ -58,7 +58,10 @@ async def test_start_and_help_handlers(caplog, tmp_path, monkeypatch):
     import json
     with open(subs_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-        assert 1 in data
+        # keys saved as strings
+        assert '1' in data
+    assert data['1'].get('first_name') == 'Test'
+    assert data['1'].get('last_name') == 'Tester'
 
 
 def test_main_raises_when_token_missing(monkeypatch):
@@ -109,7 +112,7 @@ async def test_notifyme_sends_message(tmp_path, monkeypatch):
     class DummyMessage:
         def __init__(self):
             self.chat = Chat(id=1, type='private')
-            self.from_user = User(id=1, is_bot=False, first_name='Test')
+            self.from_user = User(id=1, is_bot=False, first_name='Test', last_name='Tester')
             self.replies = []
         async def reply_text(self, text):
             self.replies.append(text)
@@ -138,3 +141,94 @@ async def test_notifyme_sends_message(tmp_path, monkeypatch):
     context = DummyContext(bot_obj)
     await bot.notifyme(update, context)
     assert update.message.replies[0] == "Ini pesan yang dikirimkan oleh bot ke kamu."
+
+
+@pytest.mark.asyncio
+async def test_senddata_posts_payload(monkeypatch):
+    import httpx
+    # allow all users to send data for test
+    monkeypatch.setenv("SENDDATA_ADMIN_ONLY", "0")
+    monkeypatch.setenv("DATA_ENDPOINT", "https://example.com/data")
+
+    called = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            called['url'] = url
+            called['json'] = json
+            class R:
+                status_code = 201
+            return R()
+
+    monkeypatch.setattr(httpx, 'AsyncClient', FakeClient)
+
+    class DummyMessage:
+        def __init__(self):
+            self.chat = Chat(id=2, type='private')
+            self.from_user = User(id=2, is_bot=False, first_name='Test2', last_name='Tester2')
+            self.text = '/senddata {"foo":"bar"}'
+            self.replies = []
+        async def reply_text(self, text):
+            self.replies.append(text)
+            return text
+
+    class DummyUpdate:
+        def __init__(self):
+            self.message = DummyMessage()
+
+    class DummyContext:
+        def __init__(self):
+            self.args = None
+            self.bot = None
+
+    update = DummyUpdate()
+    context = DummyContext()
+
+    # call handler
+    await bot.senddata(update, context)
+    # assert httpx called
+    assert called['url'] == 'https://example.com/data'
+    assert called['json']['from']['user_id'] == 2
+    assert called['json']['payload']['foo'] == 'bar'
+    assert called['json']['from']['last_name'] == 'Tester2'
+    # assert user received a success message
+    assert any('Data sent successfully' in r for r in update.message.replies)
+
+
+@pytest.mark.asyncio
+async def test_on_message_updates_subscriber(tmp_path, monkeypatch):
+    # Using a temp subscribers file
+    monkeypatch.setenv('SUBSCRIBERS_FILE', str(tmp_path / 'subs_on_msg.json'))
+
+    class DummyMessage:
+        def __init__(self):
+            self.chat = Chat(id=7, type='private')
+            self.from_user = User(id=7, is_bot=False, first_name='Joe', last_name='Blow')
+            self.text = 'hi'
+
+        async def reply_text(self, text):
+            return text
+
+    class DummyUpdate:
+        def __init__(self):
+            self.message = DummyMessage()
+
+    update = DummyUpdate()
+    context = None
+    await bot.on_message(update, context)
+
+    import json
+    with open(str(tmp_path / 'subs_on_msg.json'), 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    assert '7' in data
+    assert data['7']['first_name'] == 'Joe'
+    assert data['7']['last_name'] == 'Blow'
